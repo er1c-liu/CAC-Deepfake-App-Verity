@@ -1,6 +1,8 @@
 import argparse
 import math
 from pathlib import Path
+import json
+import os
 
 import cv2
 import numpy as np
@@ -199,7 +201,7 @@ def main():
         help="frames the model checks per second (default: 5)",
     )
     parser.add_argument(
-        "--batch-size", type=int, default=8,
+        "--batch-size", type=int, default=4,
         help="number of frames to process simultaneously (default: 8)",
     )
     args = parser.parse_args()
@@ -233,24 +235,74 @@ def main():
     count = 0
     batch = []
     video_writer = None
+    data = []
+    if(is_video):
+        data.append("Analyzing Video\n")
+    else:
+        data.append("Analyzing Image\n")
 
     def process_batch(items):
         nonlocal prob_sum, count, video_writer
-        pil_images = [item[0] for item in items]
-        probs, cams = predict_batch_with_gradcam(pil_images, model, processor, device)
-        prob_sum = probs.sum(0) if prob_sum is None else prob_sum + probs.sum(0)
-        count += len(items)
 
-        for (_pil_image, original_bgr), cam in zip(items, cams):
+        pil_images = [item[0] for item in items]
+        probs, cams = predict_batch_with_gradcam(
+            pil_images, model, processor, device
+        )
+
+        prob_sum = probs.sum(0) if prob_sum is None else prob_sum + probs.sum(0)
+
+        labels = model.id2label
+        print("\nIndividual frame predictions:")
+
+        for i, (item, frame_probs, cam) in enumerate(zip(items, probs, cams)):
+            original_image, original_bgr = item
+
+            frame_number = count + i + 1
+            predicted_id = int(frame_probs.argmax().item())
+            predicted_label = labels.get(predicted_id, str(predicted_id))
+            confidence = frame_probs[predicted_id].item() * 100
+
+            if is_video:
+                # Estimate timestamp from the sampled frame sequence.
+                timestamp = (count + i) / args.fps
+                print(
+                    f"Frame {frame_number:5d} | "
+                    f"Time: {timestamp:8.3f}s | "
+                    f"Prediction: {predicted_label} ({confidence:.1f}%)"
+                )
+                data.append(f"Frame Number:{frame_number:5d} at time {timestamp:8.3f} seconds ")
+                data.append("\n")
+                data.append(f"Prediction: {predicted_label} ({confidence:.1f}%)")
+                data.append("\n")
+            else:
+                print(
+                    f"Prediction: {predicted_label} ({confidence:.1f}%)"
+                )
+                data.append(f"Prediction: {predicted_label} ({confidence:.1f}%)")
+                data.append("\n")
+
+            for class_id, probability in enumerate(frame_probs.tolist()):
+                print(
+                    f"      {labels.get(class_id, str(class_id))}: "
+                    f"{probability * 100:.2f}%"
+                )
+
             overlay = make_overlay(original_bgr, cam)
+
             if is_video:
                 if video_writer is None:
                     height, width = overlay.shape[:2]
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                     video_writer = cv2.VideoWriter(
-                        str(output_path), fourcc, output_fps, (width, height)
+                        str(output_path),
+                        fourcc,
+                        output_fps,
+                        (width, height),
                     )
                 video_writer.write(overlay)
+
+        count += len(items)
+
 
     try:
         for item in images:
@@ -266,7 +318,9 @@ def main():
 
     report(prob_sum, count, model, is_video)
     print(f"Grad-CAM output saved to: {output_path}")
-
+    file_path = output_dir / f"{input_path.stem}_Data.json"
+    with open(file_path, "w") as file:
+        json.dump(data, file, indent=4)
 
 if __name__ == "__main__":
     main()
