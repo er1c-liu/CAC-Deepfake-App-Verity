@@ -171,19 +171,58 @@ def sampled_video_frames(video_path, sample_fps):
         cap.release()
 
 
-def report(prob_sum, count, model, is_video):
-
-    mean_probs = prob_sum / count
-    predicted_id = int(mean_probs.argmax().item())
+def find_deepfake_class_id(model):
+    """Find the class index corresponding to deepfake/fake in the model labels."""
     labels = model.id2label
-    label = labels.get(predicted_id, str(predicted_id))
-    confidence = mean_probs[predicted_id].item() * 100
+    for class_id, label in labels.items():
+        normalized = str(label).strip().lower()
+        if "deepfake" in normalized or ("fake" in normalized and "real" not in normalized):
+            return int(class_id)
+
+    # The model used by this script defaults to class 1 = Deepfake.
+    if len(labels) > 1 and 1 in labels:
+        return 1
+    raise ValueError(
+        "Could not determine the Deepfake class from model.id2label. "
+        "Please ensure the checkpoint labels identify the deepfake class."
+    )
+
+
+def report(frame_probabilities, count, model, is_video, top_k_percent):
+    """Report the image prediction or aggregate the top-scoring video frames."""
+    if not frame_probabilities:
+        raise ValueError("No frame probabilities were collected; cannot report a prediction.")
+
+    all_probs = torch.stack(frame_probabilities)
+    labels = model.id2label
 
     if is_video:
+        deepfake_class_id = find_deepfake_class_id(model)
+        k = max(1, math.ceil(count * top_k_percent / 100.0))
+        k = min(k, count)
+
+        # Rank frames by their Deepfake probability and average only the top k.
+        top_indices = torch.topk(
+            all_probs[:, deepfake_class_id], k=k, largest=True
+        ).indices
+        aggregate_probs = all_probs[top_indices].mean(dim=0)
+
         print(f"Frames checked: {count}")
+        print(
+            f"Frames used for final score: {k} ({top_k_percent:g}% top-scoring frames, "
+            f"ranked by {labels.get(deepfake_class_id, 'Deepfake')} probability)"
+        )
+    else:
+        # Single-image behavior remains unchanged.
+        aggregate_probs = all_probs.mean(dim=0)
+
+    predicted_id = int(aggregate_probs.argmax().item())
+    label = labels.get(predicted_id, str(predicted_id))
+    confidence = aggregate_probs[predicted_id].item() * 100
+
     print(f"Prediction: {label} ({confidence:.1f}%)")
-    print("Average class probabilities:")
-    for class_id, probability in enumerate(mean_probs.tolist()):
+    print("Aggregated class probabilities:")
+    for class_id, probability in enumerate(aggregate_probs.tolist()):
         print(f"  {labels.get(class_id, str(class_id))}: {probability * 100:.1f}%")
 
 
@@ -202,9 +241,20 @@ def main():
     )
     parser.add_argument(
         "--batch-size", type=int, default=4,
-        help="number of frames to process simultaneously (default: 8)",
+        help="number of frames to process simultaneously (default: 4)",
+    )
+    parser.add_argument(
+        "--top-k-percent", type=float, default=30.0,
+        help="for videos, average only the top-scoring percentage of frames by Deepfake probability (default: 30)",
     )
     args = parser.parse_args()
+
+    if not 0 < args.top_k_percent <= 100:
+        parser.error("--top-k-percent must be greater than 0 and at most 100")
+    if args.fps <= 0:
+        parser.error("--fps must be greater than 0")
+    if args.batch_size < 1:
+        parser.error("--batch-size must be at least 1")
 
     input_path = Path(args.input).expanduser().resolve()
 
@@ -231,7 +281,7 @@ def main():
         output_fps = None
         print(f"Heatmap image: {output_path}")
 
-    prob_sum = None
+    all_probabilities = []
     count = 0
     batch = []
     video_writer = None
@@ -242,14 +292,15 @@ def main():
         data.append("Analyzing Image\n")
 
     def process_batch(items):
-        nonlocal prob_sum, count, video_writer
+        nonlocal count, video_writer
 
         pil_images = [item[0] for item in items]
         probs, cams = predict_batch_with_gradcam(
             pil_images, model, processor, device
         )
 
-        prob_sum = probs.sum(0) if prob_sum is None else prob_sum + probs.sum(0)
+        # Keep every frame's probabilities so video aggregation can select the top k.
+        all_probabilities.extend(frame_probs.clone() for frame_probs in probs)
 
         labels = model.id2label
         print("\nIndividual frame predictions:")
@@ -316,7 +367,7 @@ def main():
         if video_writer is not None:
             video_writer.release()
 
-    report(prob_sum, count, model, is_video)
+    report(all_probabilities, count, model, is_video, args.top_k_percent)
     print(f"Grad-CAM output saved to: {output_path}")
     file_path = output_dir / f"{input_path.stem}_Data.json"
     with open(file_path, "w") as file:
