@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 import json
 import os
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -188,42 +189,112 @@ def find_deepfake_class_id(model):
     )
 
 
+def summarize_probabilities(probabilities, labels):
+    """Convert a class-probability tensor into a JSON-serializable summary."""
+    predicted_id = int(probabilities.argmax().item())
+    return {
+        "prediction": labels.get(predicted_id, str(predicted_id)),
+        "confidence_percent": round(float(probabilities[predicted_id].item()) * 100, 4),
+        "class_probabilities_percent": {
+            labels.get(class_id, str(class_id)): round(float(probability) * 100, 4)
+            for class_id, probability in enumerate(probabilities.tolist())
+        },
+    }
+
+
 def report(frame_probabilities, count, model, is_video, top_k_percent):
-    """Report the image prediction or aggregate the top-scoring video frames."""
+    """Compute and print both all-frame-average and top-k video results."""
     if not frame_probabilities:
         raise ValueError("No frame probabilities were collected; cannot report a prediction.")
 
     all_probs = torch.stack(frame_probabilities)
     labels = model.id2label
 
+    # Baseline aggregation: average the predicted class probabilities over every sampled frame.
+    average_probs = all_probs.mean(dim=0)
+    average_result = summarize_probabilities(average_probs, labels)
+
+    deepfake_class_id = find_deepfake_class_id(model)
     if is_video:
-        deepfake_class_id = find_deepfake_class_id(model)
         k = max(1, math.ceil(count * top_k_percent / 100.0))
         k = min(k, count)
-
-        # Rank frames by their Deepfake probability and average only the top k.
+        # Top-k aggregation: select frames with the highest Deepfake probability,
+        # then average their full class-probability vectors.
         top_indices = torch.topk(
             all_probs[:, deepfake_class_id], k=k, largest=True
         ).indices
-        aggregate_probs = all_probs[top_indices].mean(dim=0)
-
+        top_k_probs = all_probs[top_indices].mean(dim=0)
         print(f"Frames checked: {count}")
         print(
-            f"Frames used for final score: {k} ({top_k_percent:g}% top-scoring frames, "
+            f"Frames used for top-k result: {k} ({top_k_percent:g}% top-scoring frames, "
             f"ranked by {labels.get(deepfake_class_id, 'Deepfake')} probability)"
         )
     else:
-        # Single-image behavior remains unchanged.
-        aggregate_probs = all_probs.mean(dim=0)
+        # With a single image, both aggregation methods use that image's probabilities.
+        k = count
+        top_k_probs = average_probs
 
-    predicted_id = int(aggregate_probs.argmax().item())
-    label = labels.get(predicted_id, str(predicted_id))
-    confidence = aggregate_probs[predicted_id].item() * 100
+    top_k_result = summarize_probabilities(top_k_probs, labels)
 
-    print(f"Prediction: {label} ({confidence:.1f}%)")
-    print("Aggregated class probabilities:")
-    for class_id, probability in enumerate(aggregate_probs.tolist()):
-        print(f"  {labels.get(class_id, str(class_id))}: {probability * 100:.1f}%")
+    print("\nAverage probability result (all sampled frames):")
+    print(f"Prediction: {average_result['prediction']} ({average_result['confidence_percent']:.1f}%)")
+    for label, probability in average_result["class_probabilities_percent"].items():
+        print(f"  {label}: {probability:.2f}%")
+
+    print("\nTop-k sampling result:")
+    print(f"Prediction: {top_k_result['prediction']} ({top_k_result['confidence_percent']:.1f}%)")
+    for label, probability in top_k_result["class_probabilities_percent"].items():
+        print(f"  {label}: {probability:.2f}%")
+
+    return {
+        "frames_checked": int(count),
+        "average_probability_result": average_result,
+        "top_k_sampling_result": {
+            **top_k_result,
+            "top_k_percent": float(top_k_percent) if is_video else None,
+            "frames_used": int(k),
+            "selection_rule": (
+                "Average the top-scoring frames ranked by Deepfake probability"
+                if is_video else
+                "Single-image result; identical to the average probability result"
+            ),
+        },
+    }
+
+
+def append_result_to_json(results_path, run_record):
+    """Append one run summary while preserving all existing JSON content."""
+    results_path = Path(results_path)
+    if results_path.exists():
+        with results_path.open("r", encoding="utf-8") as file:
+            existing = json.load(file)
+    else:
+        existing = []
+
+    if isinstance(existing, list):
+        existing.append(run_record)
+        payload = existing
+    elif isinstance(existing, dict):
+        # Support an existing object that already stores run records in a list.
+        if isinstance(existing.get("runs"), list):
+            existing["runs"].append(run_record)
+        elif isinstance(existing.get("results"), list):
+            existing["results"].append(run_record)
+        else:
+            # Preserve existing keys and put appended runs under a dedicated key.
+            existing["runs"] = [run_record]
+        payload = existing
+    else:
+        raise ValueError(
+            f"Cannot append to {results_path}: expected a JSON list or object at the root."
+        )
+
+    # Write atomically so an interrupted run does not leave results.json half-written.
+    temporary_path = results_path.with_suffix(results_path.suffix + ".tmp")
+    with temporary_path.open("w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=4, ensure_ascii=False)
+        file.write("\n")
+    os.replace(temporary_path, results_path)
 
 
 def main():
@@ -367,11 +438,26 @@ def main():
         if video_writer is not None:
             video_writer.release()
 
-    report(all_probabilities, count, model, is_video, args.top_k_percent)
+    summary = report(all_probabilities, count, model, is_video, args.top_k_percent)
     print(f"Grad-CAM output saved to: {output_path}")
+
+    # Keep the existing per-input frame log, and also append the aggregate results
+    # to one cumulative results.json file in the model's results directory.
     file_path = output_dir / f"{input_path.stem}_Data.json"
-    with open(file_path, "w") as file:
+    with file_path.open("w", encoding="utf-8") as file:
         json.dump(data, file, indent=4)
+
+    results_json_path = output_dir / f"{input_path.stem}_Final_Results.json"
+    run_record = {
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "input_file": str(input_path),
+        "input_type": "video" if is_video else "image",
+        "sampling_fps": float(args.fps) if is_video else None,
+        "top_k_percent_requested": float(args.top_k_percent) if is_video else None,
+        **summary,
+    }
+    append_result_to_json(results_json_path, run_record)
+    print(f"Aggregate results appended to: {results_json_path}")
 
 if __name__ == "__main__":
     main()
