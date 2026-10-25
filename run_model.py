@@ -1,9 +1,9 @@
 import argparse
-import math
-from pathlib import Path
 import json
+import math
 import os
 from datetime import datetime
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -69,9 +69,7 @@ def choose_device():
 
 def load_model(model_dir, device):
     model_dir = Path(model_dir).expanduser().resolve()
-    clip_config = model_dir / "config.json"
     head_path = model_dir / "head_weights.pt"
-    processor_config = model_dir / "preprocessor_config.json"
 
     clip = CLIPVisionModel.from_pretrained(str(model_dir), local_files_only=True)
     processor = CLIPImageProcessor.from_pretrained(str(model_dir), local_files_only=True)
@@ -84,51 +82,92 @@ def load_model(model_dir, device):
         model.id2label = {int(k): str(v) for k, v in checkpoint["id2label"].items()}
 
     model.to(device).eval()
+
+    # This is an inference-only script. Frozen parameters avoid storing parameter-gradient
+    # state; Grad-CAM creates gradients only for the activation it actually needs.
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
     return model, processor
 
 
-def predict_batch_with_gradcam(images, model, processor, device):
+def _replace_first_output(output, activation):
+    """Return a module output with its first tensor replaced by the CAM leaf tensor."""
+    if isinstance(output, tuple):
+        return (activation, *output[1:])
+    if isinstance(output, list):
+        return [activation, *output[1:]]
+    return activation
+
+
+def predict_batch(images, model, processor, device, compute_gradcam=True):
+    # CPU preprocessing is performed once for the entire batch.
+    inputs = processor(images=images, return_tensors="pt")["pixel_values"].to(
+        device, non_blocking=(device.type == "cuda")
+    )
+
+    if not compute_gradcam:
+        # Fast inference path: no autograd graph is built at all.
+        with torch.inference_mode():
+            logits = model(inputs)
+            probabilities = torch.softmax(logits, dim=1).cpu()
+        return probabilities, None
+
     vision_backbone = getattr(model.clip_vision, "vision_model", model.clip_vision)
     layers = vision_backbone.encoder.layers
     target_layer = layers[-2] if len(layers) > 1 else layers[-1]
     captured = {}
 
     def save_activation(_module, _inputs, output):
-        activation = output[0] if isinstance(output, tuple) else output
-        activation.retain_grad()
+        # Detach at the selected layer and restart autograd from this activation.
+        # Since model weights are frozen, earlier CLIP layers run without building a
+        # backward graph. Gradients are then calculated only through the layers after
+        # this target, which is sufficient for Grad-CAM.
+        value = output[0] if isinstance(output, (tuple, list)) else output
+        activation = value.detach().requires_grad_(True)
         captured["activation"] = activation
+        return _replace_first_output(output, activation)
 
     hook = target_layer.register_forward_hook(save_activation)
     try:
-        inputs = processor(images=images, return_tensors="pt")["pixel_values"].to(device)
-        model.zero_grad(set_to_none=True)
-        logits = model(inputs)
-        probabilities = torch.softmax(logits.detach(), dim=1).cpu()
-        target_classes = logits.detach().argmax(dim=1)
-        logits.gather(1, target_classes.unsqueeze(1)).sum().backward()
+        # Do not use inference_mode here: Grad-CAM needs gradients for one activation.
+        with torch.enable_grad():
+            logits = model(inputs)
+            probabilities = torch.softmax(logits.detach(), dim=1).cpu()
+            target_classes = logits.detach().argmax(dim=1)
+            target_scores = logits.gather(1, target_classes.unsqueeze(1)).sum()
+            gradients, = torch.autograd.grad(
+                target_scores,
+                captured["activation"],
+                retain_graph=False,
+                create_graph=False,
+            )
 
-        activations = captured["activation"]
-        gradients = activations.grad
-        activations = activations[:, 1:, :]
-        gradients = gradients[:, 1:, :]
-        weights = gradients.mean(dim=1, keepdim=True)
-        cams = torch.relu((weights * activations).sum(dim=-1))
+        # CAM post-processing itself needs no gradients.
+        with torch.no_grad():
+            activations = captured["activation"].detach()[:, 1:, :]
+            gradients = gradients.detach()[:, 1:, :]
+            weights = gradients.mean(dim=1, keepdim=True)
+            cams = torch.relu((weights * activations).sum(dim=-1))
 
-        grid_size = math.isqrt(cams.shape[1])
-        cams = cams.reshape(cams.shape[0], 1, grid_size, grid_size)
-        cams = F.interpolate(
-            cams,
-            size=inputs.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(1)
+            grid_size = math.isqrt(cams.shape[1])
+            if grid_size * grid_size != cams.shape[1]:
+                raise RuntimeError(
+                    f"Grad-CAM expected a square patch grid, got {cams.shape[1]} patches."
+                )
+            cams = cams.reshape(cams.shape[0], 1, grid_size, grid_size)
+            cams = F.interpolate(
+                cams,
+                size=inputs.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1)
 
-        cams = cams - cams.amin(dim=(1, 2), keepdim=True)
-        cams = cams / cams.amax(dim=(1, 2), keepdim=True).clamp_min(1e-8)
-        return probabilities, [cam.detach().cpu().numpy() for cam in cams]
+            cams = cams - cams.amin(dim=(1, 2), keepdim=True)
+            cams = cams / cams.amax(dim=(1, 2), keepdim=True).clamp_min(1e-8)
+        return probabilities, [cam.cpu().numpy() for cam in cams]
     finally:
         hook.remove()
-        model.zero_grad(set_to_none=True)
 
 
 def make_overlay(original_bgr, cam):
@@ -141,32 +180,38 @@ def make_overlay(original_bgr, cam):
 
 def video_source_fps(video_path):
     cap = cv2.VideoCapture(str(video_path))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    cap.release()
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+    finally:
+        cap.release()
+    if not math.isfinite(fps) or fps <= 0:
+        raise ValueError(f"Could not determine a valid source FPS for video: {video_path}")
     return fps
 
 
 def sampled_video_frames(video_path, sample_fps):
+    """Yield sampled frames; retrieve pixel data only for frames that will be analyzed."""
     cap = cv2.VideoCapture(str(video_path))
     source_fps = cap.get(cv2.CAP_PROP_FPS)
+    if not math.isfinite(source_fps) or source_fps <= 0:
+        cap.release()
+        raise ValueError(f"Could not determine a valid source FPS for video: {video_path}")
+
     interval = 1.0 / sample_fps
     next_sample_time = 0.0
     frame_index = 0
 
     try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-
+        while cap.grab():
             timestamp = frame_index / source_fps
             if timestamp + 1e-9 >= next_sample_time:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                yield Image.fromarray(rgb), frame.copy()
+                ok, frame = cap.retrieve()
+                if ok:
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    yield Image.fromarray(rgb), frame.copy()
                 next_sample_time += interval
                 while next_sample_time <= timestamp:
                     next_sample_time += interval
-
             frame_index += 1
     finally:
         cap.release()
@@ -180,7 +225,6 @@ def find_deepfake_class_id(model):
         if "deepfake" in normalized or ("fake" in normalized and "real" not in normalized):
             return int(class_id)
 
-    # The model used by this script defaults to class 1 = Deepfake.
     if len(labels) > 1 and 1 in labels:
         return 1
     raise ValueError(
@@ -209,8 +253,6 @@ def report(frame_probabilities, count, model, is_video, top_k_percent):
 
     all_probs = torch.stack(frame_probabilities)
     labels = model.id2label
-
-    # Baseline aggregation: average the predicted class probabilities over every sampled frame.
     average_probs = all_probs.mean(dim=0)
     average_result = summarize_probabilities(average_probs, labels)
 
@@ -218,8 +260,6 @@ def report(frame_probabilities, count, model, is_video, top_k_percent):
     if is_video:
         k = max(1, math.ceil(count * top_k_percent / 100.0))
         k = min(k, count)
-        # Top-k aggregation: select frames with the highest Deepfake probability,
-        # then average their full class-probability vectors.
         top_indices = torch.topk(
             all_probs[:, deepfake_class_id], k=k, largest=True
         ).indices
@@ -230,7 +270,6 @@ def report(frame_probabilities, count, model, is_video, top_k_percent):
             f"ranked by {labels.get(deepfake_class_id, 'Deepfake')} probability)"
         )
     else:
-        # With a single image, both aggregation methods use that image's probabilities.
         k = count
         top_k_probs = average_probs
 
@@ -275,13 +314,11 @@ def append_result_to_json(results_path, run_record):
         existing.append(run_record)
         payload = existing
     elif isinstance(existing, dict):
-        # Support an existing object that already stores run records in a list.
         if isinstance(existing.get("runs"), list):
             existing["runs"].append(run_record)
         elif isinstance(existing.get("results"), list):
             existing["results"].append(run_record)
         else:
-            # Preserve existing keys and put appended runs under a dedicated key.
             existing["runs"] = [run_record]
         payload = existing
     else:
@@ -289,7 +326,6 @@ def append_result_to_json(results_path, run_record):
             f"Cannot append to {results_path}: expected a JSON list or object at the root."
         )
 
-    # Write atomically so an interrupted run does not leave results.json half-written.
     temporary_path = results_path.with_suffix(results_path.suffix + ".tmp")
     with temporary_path.open("w", encoding="utf-8") as file:
         json.dump(payload, file, indent=4, ensure_ascii=False)
@@ -299,7 +335,7 @@ def append_result_to_json(results_path, run_record):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run the local deepfake detector on an image or video and save Grad-CAM overlays"
+        description="Run the local deepfake detector on an image or video and optionally save Grad-CAM overlays"
     )
     parser.add_argument("input", help="image/video path")
     parser.add_argument(
@@ -318,22 +354,34 @@ def main():
         "--top-k-percent", type=float, default=30.0,
         help="for videos, average only the top-scoring percentage of frames by Deepfake probability (default: 30)",
     )
+    parser.add_argument(
+        "--no-gradcam", action="store_true",
+        help="skip Grad-CAM and overlay writing for faster prediction-only inference",
+    )
+    parser.add_argument(
+        "--quiet-frames", action="store_true",
+        help="suppress per-frame console output (per-frame data is still saved)",
+    )
     args = parser.parse_args()
 
     if not 0 < args.top_k_percent <= 100:
         parser.error("--top-k-percent must be greater than 0 and at most 100")
-    if args.fps <= 0:
+    if not math.isfinite(args.fps) or args.fps <= 0:
         parser.error("--fps must be greater than 0")
     if args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
 
     input_path = Path(args.input).expanduser().resolve()
+    if not input_path.is_file():
+        parser.error(f"Input file does not exist or is not a file: {input_path}")
 
     is_video = input_path.suffix.lower() in VIDEO_EXTENSIONS
     model_dir = Path(args.model_dir).expanduser().resolve()
     output_dir = model_dir / "results"
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / (f"{input_path.stem}_gradcam.mp4" if is_video else f"{input_path.stem}_gradcam.png")
+    output_path = output_dir / (
+        f"{input_path.stem}_gradcam.mp4" if is_video else f"{input_path.stem}_gradcam.png"
+    )
 
     device = choose_device()
     print(f"Device: {device}")
@@ -343,88 +391,89 @@ def main():
         source_fps = video_source_fps(input_path)
         output_fps = min(args.fps, source_fps)
         images = sampled_video_frames(input_path, args.fps)
-        print(f"Output video: {output_path} ({output_fps:g} FPS)")
+        if args.no_gradcam:
+            print("Grad-CAM disabled; no overlay video will be written.")
+        else:
+            print(f"Output video: {output_path} ({output_fps:g} FPS)")
     else:
         with Image.open(input_path) as image_file:
             image = image_file.convert("RGB")
         original_bgr = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
         images = [(image, original_bgr)]
         output_fps = None
-        print(f"Heatmap image: {output_path}")
+        if args.no_gradcam:
+            print("Grad-CAM disabled; no overlay image will be written.")
+        else:
+            print(f"Heatmap image: {output_path}")
 
     all_probabilities = []
     count = 0
     batch = []
     video_writer = None
-    data = []
-    if(is_video):
-        data.append("Analyzing Video\n")
-    else:
-        data.append("Analyzing Image\n")
+    data = ["Analyzing Video\n" if is_video else "Analyzing Image\n"]
 
     def process_batch(items):
         nonlocal count, video_writer
 
         pil_images = [item[0] for item in items]
-        probs, cams = predict_batch_with_gradcam(
-            pil_images, model, processor, device
+        probs, cams = predict_batch(
+            pil_images, model, processor, device, compute_gradcam=not args.no_gradcam
         )
-
-        # Keep every frame's probabilities so video aggregation can select the top k.
-        all_probabilities.extend(frame_probs.clone() for frame_probs in probs)
-
+        all_probabilities.extend(frame_probs for frame_probs in probs)
         labels = model.id2label
-        print("\nIndividual frame predictions:")
 
-        for i, (item, frame_probs, cam) in enumerate(zip(items, probs, cams)):
-            original_image, original_bgr = item
+        if not args.quiet_frames:
+            print("\nIndividual frame predictions:")
 
+        for i, (item, frame_probs) in enumerate(zip(items, probs)):
+            _, original_bgr = item
             frame_number = count + i + 1
+            frame_values = frame_probs.tolist()
             predicted_id = int(frame_probs.argmax().item())
             predicted_label = labels.get(predicted_id, str(predicted_id))
-            confidence = frame_probs[predicted_id].item() * 100
+            confidence = frame_values[predicted_id] * 100
 
             if is_video:
-                # Estimate timestamp from the sampled frame sequence.
                 timestamp = (count + i) / args.fps
-                print(
-                    f"Frame {frame_number:5d} | "
-                    f"Time: {timestamp:8.3f}s | "
-                    f"Prediction: {predicted_label} ({confidence:.1f}%)"
-                )
-                data.append(f"Frame Number:{frame_number:5d} at time {timestamp:8.3f} seconds ")
-                data.append("\n")
-                data.append(f"Prediction: {predicted_label} ({confidence:.1f}%)")
-                data.append("\n")
-            else:
-                print(
-                    f"Prediction: {predicted_label} ({confidence:.1f}%)"
-                )
-                data.append(f"Prediction: {predicted_label} ({confidence:.1f}%)")
-                data.append("\n")
-
-            for class_id, probability in enumerate(frame_probs.tolist()):
-                print(
-                    f"      {labels.get(class_id, str(class_id))}: "
-                    f"{probability * 100:.2f}%"
-                )
-
-            overlay = make_overlay(original_bgr, cam)
-
-            if is_video:
-                if video_writer is None:
-                    height, width = overlay.shape[:2]
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    video_writer = cv2.VideoWriter(
-                        str(output_path),
-                        fourcc,
-                        output_fps,
-                        (width, height),
+                if not args.quiet_frames:
+                    print(
+                        f"Frame {frame_number:5d} | Time: {timestamp:8.3f}s | "
+                        f"Prediction: {predicted_label} ({confidence:.1f}%)"
                     )
-                video_writer.write(overlay)
+                data.extend([
+                    f"Frame Number:{frame_number:5d} at time {timestamp:8.3f} seconds ",
+                    "\n",
+                    f"Prediction: {predicted_label} ({confidence:.1f}%)",
+                    "\n",
+                ])
+            else:
+                if not args.quiet_frames:
+                    print(f"Prediction: {predicted_label} ({confidence:.1f}%)")
+                data.extend([f"Prediction: {predicted_label} ({confidence:.1f}%)", "\n"])
+
+            if not args.quiet_frames:
+                for class_id, probability in enumerate(frame_values):
+                    print(f"      {labels.get(class_id, str(class_id))}: {probability * 100:.2f}%")
+
+            if cams is not None:
+                overlay = make_overlay(original_bgr, cams[i])
+                if is_video:
+                    if video_writer is None:
+                        height, width = overlay.shape[:2]
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        video_writer = cv2.VideoWriter(
+                            str(output_path), fourcc, output_fps, (width, height)
+                        )
+                        if not video_writer.isOpened():
+                            video_writer.release()
+                            video_writer = None
+                            raise RuntimeError(f"Could not create output video: {output_path}")
+                    video_writer.write(overlay)
+                elif not is_video:
+                    if not cv2.imwrite(str(output_path), overlay):
+                        raise RuntimeError(f"Could not write Grad-CAM image: {output_path}")
 
         count += len(items)
-
 
     try:
         for item in images:
@@ -439,12 +488,11 @@ def main():
             video_writer.release()
 
     summary = report(all_probabilities, count, model, is_video, args.top_k_percent)
-    print(f"Grad-CAM output saved to: {output_path}")
+    if not args.no_gradcam:
+        print(f"Grad-CAM output saved to: {output_path}")
 
-    # Keep the existing per-input frame log, and also append the aggregate results
-    # to one cumulative results.json file in the model's results directory.
-    file_path = output_dir / f"{input_path.stem}_Data.json"
-    with file_path.open("w", encoding="utf-8") as file:
+    data_path = output_dir / f"{input_path.stem}_Data.json"
+    with data_path.open("w", encoding="utf-8") as file:
         json.dump(data, file, indent=4)
 
     results_json_path = output_dir / f"{input_path.stem}_Final_Results.json"
@@ -458,6 +506,7 @@ def main():
     }
     append_result_to_json(results_json_path, run_record)
     print(f"Aggregate results appended to: {results_json_path}")
+
 
 if __name__ == "__main__":
     main()
